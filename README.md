@@ -1,7 +1,7 @@
 # 🦑 SUquid Quiz
 A real-time multiplayer trivia quiz game built with Python. Players connect over TCP sockets to compete in live quiz rounds with dynamic scoring — first correct answer gets bonus points. Features a tkinter GUI for both server and client, multithreaded connection handling, and graceful mid-game disconnection support
 
-**Authors:** Sedra Alyousef & Salma Tubail
+**Authors:** Sedra Alyousef (server) & Salma Tubail (client)
 
 ---
 ## Features
@@ -91,3 +91,13 @@ Originally, `remove_client()` deleted the player's score when they left. This me
 
 **Bonus points for speed**
 To reward fast answers, the first player to answer correctly in a round gets extra points equal to the number of other players in the game. This means the point gap can grow quickly in larger lobbies, keeping the competition exciting.
+
+---
+## Project Structure:
+
+```
+├── Server.py                    # Server application
+├── Client.py                    # Client application
+├── questions.txt                # Example question file
+└── README.md
+```
