@@ -1,185 +1,638 @@
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
- 
+from tkinter import scrolledtext, messagebox
 import socket
 import threading
+import select
+from queue import Queue, Empty
 
-bg_color = "#F3B9DF" # background and foreground colors for the GUI 
-fg_color = "black"
 
+class GameServer:
+    # constructor:
+    def __init__(self, master:tk.Tk):
+        self.master = master
+        master.geometry("700x500")
+        master.title("Game Server")
 
-class SUquidQuizClient:
+        self.server_socket = None
+        self.is_listening = False
+        self.players = {}  # {client_socket: name}
+        self.thread = None
+        self.scores = {}  # {username: score}
+        self.all_time_scores = {} #stores all scores recorded during the game
+        self.questions = []
 
-    def __init__(self, master: tk.Tk): #constructor
-        self.master = master # stores  master ins teh main tkinter window
-        self.master.title("SUquid Quiz Client")
-        self.master.configure(bg=bg_color)
+        self.n_questions = 0 # questions in game
+        self.questions_in_file = 0 # questions in the file
 
-        self.client_socket = None #tcp socket obj
-        self.is_connected = False # connection status flag  to controlthreads
-        self.rec_thread = None #bgtread for recieving thread
+        self.round_answers = {} # {client_socket: selected_option}
 
-        self.answer_var = tk.StringVar(value="") # tkinter variable to hold selected answer from radio buttons
+        self.file_loaded = False
+        self.n_questions_valid = False
+        self.game_ended = False
+
+        self.inbox = Queue()          # (client_socket, message)
+        self.disconnected = set()     # sockets that disconnected
+
+        self.accepting_clients =    False
 
         self.create_widgets()
-        self.master.protocol("WM_DELETE_WINDOW", self.on_closing) # handle window close event, so socket closes
+        self.master.after(100, self.poll_inbox)
 
-    #### GUI Setup and Layout
+#===================================================================================================================================
+# GUI FUNCTIONS:///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#===================================================================================================================================
 
+    # this function handles the GUI (at the start)
     def create_widgets(self):
-        # connection frame that holds IP, Port, Username entries for player to connect to server
-        conn_frame = tk.Frame(self.master, bg=bg_color)
-        conn_frame.grid(row=0, column=0, columnspan=6, padx=10, pady=5, sticky="w")
+        # creating a frame within master for port & listen button
+        self.port_frame = tk.Frame(self.master)
+        self.port_frame.pack(pady = 20)
 
-        tk.Label(conn_frame, text="IP:", bg=bg_color, fg=fg_color).grid(row=0, column=0)
-        self.ip_entry = tk.Entry(conn_frame)
-        self.ip_entry.grid(row=0, column=1)
+        # get port and assign it to attribute so we can access it later
+        tk.Label(self.port_frame, text= "Port: ").pack()
+        self.port_entry = tk.Entry(self.port_frame)
+        self.port_entry.pack()
+        
+        # creating a button for listening:
+        self.listen_button = tk.Button(self.port_frame, text = "Listen", command = self.toggle_listening)
+        self.listen_button.pack(pady = 10)
 
-        tk.Label(conn_frame, text="Port:", bg=bg_color, fg=fg_color).grid(row=0, column=2)
-        self.port_entry = tk.Entry(conn_frame)
-        self.port_entry.grid(row=0, column=3)
 
-        tk.Label(conn_frame, text="Username:", bg=bg_color, fg=fg_color).grid(row=0, column=4)
-        self.username_entry = tk.Entry(conn_frame)
-        self.username_entry.grid(row=0, column=5)
 
-        self.connect_button = tk.Button(self.master, text="Connect", command=self.toggle_connection)
-        self.connect_button.grid(row=1, column=0, columnspan=6, pady=5)
+        # log:
+        self.log = tk.Listbox(self.master , height = 30,  state = tk.DISABLED, fg = "black", bg = "white")
+        self.log.pack(side = tk.LEFT, fill = tk.BOTH, expand = True)
 
-        radio_frame = tk.Frame(self.master, bg=bg_color)
-        radio_frame.grid(row=2, column=0, columnspan=6)
-
-        tk.Radiobutton(radio_frame, text="A", value="A", variable=self.answer_var, # all buttons share same variable so one answeer is selected
-                       bg=bg_color, fg=fg_color).grid(row=0, column=1)
-        tk.Radiobutton(radio_frame, text="B", value="B", variable=self.answer_var,
-                       bg=bg_color, fg=fg_color).grid(row=1, column=1)
-        tk.Radiobutton(radio_frame, text="C", value="C", variable=self.answer_var,
-                       bg=bg_color, fg=fg_color).grid(row=2, column=1)
-
-        self.submit_button = tk.Button(self.master, text="Submit",
-                                       command=self.submit_answer, state=tk.DISABLED) #disabled until recieve question, prevents invalid submission
-        self.submit_button.grid(row=3, column=0, columnspan=6, pady=5)
-
-        # message display frame containing a scrollable listbox 
-        frame = tk.Frame(self.master, bg=bg_color)
-        frame.grid(row=4, column=0, columnspan=6, padx=10, pady=10, sticky="nsew")
-
-        self.msg_listbox = tk.Listbox(frame, height=20, width=120,bg=bg_color, fg=fg_color)
-        self.msg_listbox.pack(side=tk.LEFT, fill=tk.BOTH)
-
-        scrollbar = tk.Scrollbar(frame)
+        # scrollbar for the listbox
+        scrollbar = tk.Scrollbar(self.master, command=self.log.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log.config(yscrollcommand=scrollbar.set)
 
-        self.msg_listbox.config(yscrollcommand=scrollbar.set)
-        scrollbar.config(command=self.msg_listbox.yview)
+        # game setup state: (disabled for now)
+        self.game_setup_frame = tk.Frame(self.master)
+        # self.game_setup_frame.pack(pady = 30)
 
-    #### Connection Management
+        tk.Label(self.game_setup_frame, text = "Enter File Name: ", state = tk.DISABLED).pack()
+        self.filename_entry = tk.Entry(self.game_setup_frame, state = tk.DISABLED)
+        self.filename_entry.pack()
+        
+        tk.Label(self.game_setup_frame, text = "Number of Questions: ", state = tk.DISABLED).pack()
+        self.n_questions_entry = tk.Entry(self.game_setup_frame, state = tk.DISABLED)
+        self.n_questions_entry.pack(pady = 20)
 
-    # connect or disconnect based on current state
-    def toggle_connection(self): 
-        if self.is_connected:
-            self.disconnect()
+        self.game_start_button = tk.Button(self.game_setup_frame, text = "START GAME", command = self.game_setup, state = tk.DISABLED)
+        self.game_start_button.pack(pady = 20)
+
+        self.game_log = tk.Text(self.master, state = tk.DISABLED)
+
+#=================================================================================================================================
+# STRTING & STOPPING SERVER: ////////////////////////////////////////////////////////////////////////////////////////////////////
+#=================================================================================================================================
+    # so we can listen and stop the server from the same button
+    # when the server isnt listening: press to listen, if its already listening:  press to stop listening
+    def toggle_listening(self):
+        if self.is_listening:
+            self.stop_listening()
         else:
-            self.connect()
+            self.start_listening()
 
-    def connect(self):
-        # get IP, Port, and Username from user entries and remove leading or trailing spaces
-        ip = self.ip_entry.get().strip() 
-        port = self.port_entry.get().strip()
-        username = self.username_entry.get().strip()
+    # in this function the server socket is created and it starts listening for new clients
+    def start_listening(self):
+        port_str = self.port_entry.get()
 
-        if not ip or not port or not username: # check all fields are filled
-            messagebox.showerror("Error", "All fields are required.")
-            self.insert_msg_to_listbox("Please fill all fields")
+        if not port_str:
+            messagebox.showerror("Error", "Please enter a port number.")
             return
-
+        
         try:
-            port = int(port)
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # creates TCP socket 
-            self.client_socket.connect((ip, port))
-            self.client_socket.sendall(username.encode())
+            port = int(port_str)
+            ip = socket.gethostbyname(socket.gethostname()) # get my ip
+            #self.log_message(ip)
+            addr = ("0.0.0.0", port)
+
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.bind(addr)
+            self.server_socket.listen(5)
+            
+            self.is_listening = True
+            self.accepting_clients = True
+            self.listen_button.config(text="Stop Listening") # change the text on listen_button
+            self.log_message(f"======== SERVER LISTENING ON PORT {(ip, port)} =========")
+            #self.log_message(f"Bound addr: {self.server_socket.getsockname()}")
+            
+            self.thread = threading.Thread(target=self.accept_connections, daemon=True)
+            self.thread.start()
+            
+            self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         except (socket.error, ValueError) as e:
-            messagebox.showerror("Connection Failed", str(e))
-            self.insert_msg_to_listbox(f"Could not connect: {e}")
-            return
+            messagebox.showerror("Server Error", f"Could not start server: {e}")
+            self.is_listening = False
+            if self.server_socket:
+                self.server_socket.close()
 
-        self.is_connected = True
-        self.connect_button.config(text="Disconnect")
-        self.insert_msg_to_listbox(f"Connected to {ip}:{port} as {username}")
+        # function to stop the server and disconnect all clients
 
-        self.rec_thread = threading.Thread(target=self.receive_messages, daemon=True)
-        self.rec_thread.start() #creates bg thread to handle incoming messages  and prevent freezing GUI
-        #daemon automatically terminates thread when main program exits
+    
+    # SO THE SERVER STOPS LISTENING: 
+    def stop_listening(self): 
+        if self.is_listening:
+            self.is_listening = False
+            self.accepting_clients  = False
+            for client_socket in list(self.players.keys()):
+                self.remove_client(client_socket)
+            
+            self.server_socket.close()
+            self.listen_button.config(text="Listen") # change listen_button text back to listen
+            self.log_message("--- Server stopped ---")
 
-    def disconnect(self):
-        if self.is_connected:
-            self.is_connected = False # stops recieving loop
-            self.client_socket.close()
-            self.submit_button.config(state=tk.DISABLED)
-            self.connect_button.config(text="Connect")  #restores UI to intial state
-            self.insert_msg_to_listbox("Disconnected from server")
-
-    #### Receiving and Processing Messages
-
-    def receive_messages(self):
-        while self.is_connected: # loop to continuously receive messages from server as long as conneceted
+    # when window is closed: do this:
+    def on_closing(self):
+        if self.is_listening:
+            self.stop_listening()
+            self.broadcast("Server disconnected")
+        self.master.destroy()
+#===================================================================================================================================
+# HANDLING CONNECTIONS: ///////////////////////////////////////////////////////////////////////////////////////////////////////////
+#===================================================================================================================================
+    def accept_connections(self):
+        #while self.is_listening and self.accepting_clients:
+        while True:
             try:
-                message = self.client_socket.recv(4096) #reads up to 4096 bytes from socket
-                if not message:  # server has closed the connection
-                    self.master.after(0, self.disconnect)
-                    break
+                client_socket, client_address = self.server_socket.accept()
+                client_socket.settimeout(1.0)
+                username = client_socket.recv(1024).decode()
 
-                msg = message.decode(errors="ignore")
-                self.master.after(0, self.process_server_messages, msg)
+                if not self.accepting_clients:
+                    client_socket.sendall("game ongoing u cant join".encode())
+                    self.log_message("new client tried to connect during game, connection wasnt accepted")
+                    client_socket.close()
+                    continue  # maybe shouold change to continue?
+                
+                # basic validation
+                if not username:
+                    client_socket.send("ERROR: Username required".encode())
+                    client_socket.close()
+                    continue
 
-            except (socket.error, OSError): #catches network failure, client unplugged from wifi, server crashes
-                self.master.after(0, self.disconnect)
+                # reject if username already connected
+                if username in self.players.values():
+                    self.log_message(f"Player with username '{username}' tried to connect but there is already a player with that username")
+                    client_socket.send(f"ERROR: Username '{username}' already connected".encode())
+                    client_socket.close()
+                    continue
+
+                #after validating new client connections
+                self.players[client_socket] = username
+                self.log_message(f"New connection from {client_address[0]} as '{username}'")
+                self.broadcast(f"player {username} joined the game")
+
+
+                # thread for each client
+                client_thread = threading.Thread(target=self.handle_client, args=(client_socket, username), daemon=True)
+                client_thread.start()
+
+                self.players[client_socket] = username
+
+                if len(self.players.keys()) >= 1:
+                    self.start_game_setup()
+
+            except (socket.error, OSError):
+                break
+    
+#=================================================================================================================================
+# HANDLING MESSAGES + DICONNNECTIONS IN INBOX: ///////////////////////////////////////////////////////////////////////////////////
+#================================================================================================================================   
+    # function to MONITOR CLIENT MESSAGES, add them to queue
+    def handle_client(self, client_socket, username):
+        try:
+            client_socket.sendall(f"Welcome {username}! *-*".encode("utf-8"))
+
+            while not self.game_ended:
+                try:
+                    data = client_socket.recv(1024)
+                    if not data:
+                        self.inbox.put((client_socket, None))
+                        break
+
+                    msg = data.decode("utf-8", errors="ignore").strip()
+                    if msg:
+                        self.inbox.put((client_socket, msg))
+
+                except socket.timeout:
+                    # no data yet
+                    continue
+
+        except (OSError, socket.error):
+            self.inbox.put((client_socket, None))
+
+    # function to processes messages in queue
+    def poll_inbox(self):
+        #Continuously process messages/disconnects from client threads
+        drained = 0
+        while True:
+            try:
+                s, msg = self.inbox.get_nowait()
+            except Empty:
                 break
 
-    def process_server_messages(self, msg): #euns on main thread to safely update GUI
-        if not msg.strip(): # ignore empty messages
+            drained += 1
+
+            # disconnect event
+            if msg is None:
+                if s in self.players:
+                    self.remove_client(s, reason="disconnected")
+                continue
+
+
+        # keep polling forever
+        self.master.after(100, self.poll_inbox)
+
+    #fucntion to eemove the client from dicts and notify server and players
+    def remove_client(self, client_socket, reason="got disconnected"):
+        username = self.players.get(client_socket, None)
+
+        # remove from dicts first
+        if client_socket in self.players:
+            del self.players[client_socket]
+
+        if username in self.scores:
+            del self.scores[username]
+
+        # close socket
+        try:
+            client_socket.close()
+        except:
+            pass
+
+        # announce
+        if username:
+            self.log_message(f"'{username}' left the game ({reason}).")
+            self.broadcast(f"player '{username}' left the game ({reason}).")
+
+        if not self.game_ended:
+            if len(self.players) >= 2:
+                self.game_start_button.config(state=tk.NORMAL)
+            else:
+                self.game_start_button.config(state=tk.DISABLED)
+
+#===================================================================================================================================
+# LOG FUNCTIONS: ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#===================================================================================================================================
+    
+    def log_message(self, message):
+        if isinstance(message, list):
+            for line in message:
+                self.log_message(line)
             return
 
-        for line in msg.split("\n"): # display the server message line by line for clean structure
-            self.insert_msg_to_listbox(line)
+        self.log.config(state=tk.NORMAL)
+        self.log.insert(tk.END, message + "\n")
+        self.log.config(state=tk.DISABLED)
+        self.log.yview(tk.END)
 
-        if "Question" in msg: #enable answer submission when question is received
-            self.answer_var.set("")
-            self.submit_button.config(state=tk.NORMAL)
-            self.insert_msg_to_listbox("Select an option and submit to answer the question")
+    def clear_log(self):
+        self.log.config(state=tk.NORMAL)
+        self.log.delete(0, tk.END)
+        self.log.config(state=tk.DISABLED)
+#===================================================================================================================================
+# GAME SETUP WINDOW: filename, n_questions/////////////////////////////////////////////////////////////////////////////////////////
+#===================================================================================================================================
+    # the window shows after we have 1, connction but the ebutton only works after theres 2 or more connections
+    def start_game_setup(self):
+        self.port_entry.config(state = tk.DISABLED)
+        self.listen_button.config(state = tk.DISABLED)
+        self.port_frame.pack_forget()
 
-    #### Sending Answers to Server
+        self.game_setup_frame.pack(pady = 30)
+        self.filename_entry.config(state = tk.NORMAL)
+        self.n_questions_entry.config(state = tk.NORMAL)
 
-    def submit_answer(self):
-        answer = self.answer_var.get()
+        if len(list(self.players.keys())) >=2 :
+            self.game_start_button.config(state = tk.NORMAL)
 
-        # if no answer selected return with warning
-        if not answer: 
-            messagebox.showwarning("Warning", "Select an answer first.")
-            self.insert_msg_to_listbox("Must select an answer before submitting")
+
+    def game_setup(self):
+        self.file_loaded = False
+        self.n_questions_valid = False
+
+        self.questions = []
+        self.questions_in_file = 0
+        self.all_time_scores = {}
+
+        #file handling
+        filename = self.filename_entry.get().strip()
+
+        if not filename:
+            messagebox.showerror("ERROR", "PLEASE ENTER FILE NAME")
             return
 
         try:
-            self.client_socket.sendall(answer.encode())
-            self.submit_button.config(state=tk.DISABLED) # disable submit button until next question, prevents double submissions
-            self.insert_msg_to_listbox(f"Your answer '{answer}' was submitted")
-        except:
-            self.disconnect()
+            with open(filename, "r", encoding = "utf-8") as file:
+                lines = [line.strip() for line in file.readlines()]
 
-    #### diaplay in listbox
-    def insert_msg_to_listbox(self, msg):
-        self.msg_listbox.insert(tk.END, msg)
-        self.msg_listbox.yview(tk.END)
+                self.quiz = lines
 
-    def on_closing(self):# handle window close event
-        if self.is_connected:
-            self.disconnect()
-        self.master.destroy()
+                self.file_loaded = True
+                self.log_message(f"file {filename} opened successfully")
+                self.questions_in_file = int(len(lines) / 5)
+                self.log_message(f"number of questions in file: {self.questions_in_file}")
+
+                """
+                # filling correct_answers dict: (assumes file is correctly formatted, no invalid options)
+                question_number = 1
+                for i in range(0, len(lines), 5): # start 0 ==> len(lines), jump 5 indices at a time
+                    correct_option = lines[i + 4][-1].upper() 
+                    self.correct_answers[question_number] = correct_option
+                    question_number += 1
+                    """
+                
+                # filling self.questions list
+                for i in range(0, len(lines), 5):
+                    q_text = lines[i]
+                    options = [lines[i+1], lines[i+2], lines[i+3]]   # A, B, C and text
+                    correct = lines[i+4].strip()[-1].upper()             # correct option
+                    self.questions.append({"question": q_text, "options": options, "correct_option": correct})
+
+                file.close()
+
+        except FileNotFoundError:
+            messagebox.showerror("ERROR", "FILE NOT FOUND")
+        except PermissionError:
+            messagebox.showerror("File Error", f"No permission to read '{filename}'.")
+        except Exception as e:
+            messagebox.showerror("File Error", str(e))
+
+        # number of questions handling
+        n_q = self.n_questions_entry.get().strip()
+
+        try:
+            self.n_questions = int(n_q)
+            self.n_questions_valid = True
+            self.log_message(f"number of questions in game: {self.n_questions}")
+        
+        except ValueError:
+            messagebox.showerror("Input error", "number of questions should be an integer")
+            return
+        
+        # more validation of n_q
+        if self.n_questions <= 0:
+            messagebox.showerror("Input error", "Number of questions must be > 0")
+            return
+        
+        # if the number is too big that it makes no sense
+        if self.n_questions > 100:
+            messagebox.showerror("Input error", "Number of question siis too big pls be reasonable -_-")
+            return
+        
+        
+        # now start game when everything good:
+        #self.is_listening = False
+        if self.file_loaded and self.n_questions_valid:
+            threading.Thread(target=self.start_game, daemon=True).start()
+        #self.start_game()
+
+#==================================================================================================================================
+# GAME FLOW DISPLAY HELPERS: broadcast, display scoreboard, display question, dislay rankings /////////////////////////////////////////////////////
+#==================================================================================================================================
+    # function  to send message to all players
+    def broadcast(self, message, sender_socket=None):
+        if isinstance(message, list):
+            for line in message:
+                self.broadcast(str(line)+"\n")
+            return
+
+        for client_socket in list(self.players.keys()):
+            try:
+                client_socket.sendall(message.encode("utf-8"))
+            except (socket.error, OSError):
+                self.remove_client(client_socket)
+
+#=================================================================================================================================
+    """
+    def scoreboard(self, scores):
+        self.log_message("\n===== SCOREBOARD =====")
+
+        if not scores:
+            self.log_message("No scores to display.")
+            return
+
+        for username, score in scores.items():
+            self.log_message(f"{username:<15} : {score}")
+
+        self.log_message("======================") """
+    
+    # function to display screboard
+    def scoreboard(self, scores):
+        lines = []
+        lines.append("===== SCOREBOARD =====")
+
+        if not scores:
+            lines.append("No scores to display.")
+            lines.append("======================")
+            return lines
+
+        for username, score in scores.items():
+            lines.append(f"{username:<15} : {score}")
+
+        lines.append("======================")
+
+        return lines
+#=================================================================================================================================
+    #function to display question
+    def display_question(self, file_q_index, n_q_game):
+        q = self.questions[file_q_index]
+        lines = []
+
+        lines.append("[QUESTION]")
+        lines.append("" + "=" * len(q["question"]))
+        lines.append(f"Question {n_q_game}")
+        lines.append("" + q["question"])
+        lines.append("" +q["options"][0])  # OPTION A
+        lines.append("" +q["options"][1])  #  OPTION B
+        lines.append("" +q["options"][2])  # OPTION C
+        lines.append("=" * len(q["question"]) + "\n")
+
+        return lines
+
+    # function to display results and rankings at the end of the game
+    def display_results(self, scores):
+        # scores: {username: points}
+
+        # 1) sort by score desc, then name asc (for stable display)
+        sorted_items = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+
+        lines = []
+        lines.append("===== GAME OVER =====")
+        lines.append("=== FINAL RESULTS ===")
+
+        prev_score = None
+        rank = 0  # will be set when we see first item
+
+        for idx, (username, pts) in enumerate(sorted_items):
+            # idx is 0-based position in the sorted list
+            if pts != prev_score:
+                rank = idx + 1   # competition ranking jump
+                prev_score = pts
+
+            lines.append(f"{rank}. {username} — {pts}")
+
+        return lines   
+#==================================================================================================================================
+# GAME LOGIC FUNCTIONS: ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#=================================================================================================================================
+    def recieve_round_answers(self):
+        self.round_answers = {}
+
+        #update list each round
+        expected = list(self.players.keys())
+
+        while len(self.round_answers) < len(expected):
+            # if too few players, stop the round
+            if len(expected) == 0:
+                return
+
+            try:
+                s, msg = self.inbox.get(timeout=1.0)
+            except Empty:
+                continue
+
+            # if someone disconnected, remove player and update expected list
+            if msg is None:
+                if s in self.players:
+                    self.remove_client(s, reason="disconnected")
+                if s in expected:
+                    expected.remove(s)
+                continue
+
+            # ignore messages from sockets no longer in game
+            if s not in self.players:
+                continue
+
+            # ignore if already answered
+            if s in self.round_answers:
+                continue
+
+            letter = msg[0].upper()
+            self.round_answers[s] = letter
 
 
-if __name__ == "__main__": #entry point, enusres GUI runs on main thread
+#===================================================================================================================================
+    def grade_round(self, n_file_q, round_answers):
+        correct_option = self.questions[n_file_q]["correct_option"]
+        
+        first_correct = None
+        additional_points = len(self.players) - 1
+
+        for s, selected_option in self.round_answers.items():
+            username = self.players.get(s)  # use .get() instead of direct access
+            if username is None:
+                continue  # player already disconnected, skip them entirely
+
+            added_points = 0
+
+            if selected_option == correct_option:
+                self.scores[username] += 1
+                self.all_time_scores[username] += 1
+                added_points += 1
+
+                if first_correct is None:
+                    first_correct = username
+                    self.scores[username] += additional_points
+                    self.all_time_scores[username] += additional_points
+                    added_points += additional_points
+
+                try:
+                    if username == first_correct:
+                        s.sendall(f"You were the first to answer correctly! You got {added_points} points!".encode("utf-8"))
+                    else:
+                        s.sendall(f"Correct Answer! You got {added_points} point!".encode("utf-8"))
+                except (socket.error, OSError):
+                    pass  # player disconnected between answering and feedback, ignore
+
+            else:
+                try:
+                    s.sendall(f"Your Answer is wrong, the correct answer is {correct_option}".encode("utf-8"))
+                except (socket.error, OSError):
+                    pass  # same, ignore closed sockets
+                    s.sendall(f"Your Answer is wrong, the correct answer is {correct_option}".encode("utf-8"))
+
+#===================================================================================================================================
+    def end_game(self):
+        self.broadcast("Game ended. Bye Bye")
+        for s in list(self.players.keys()):
+            self.remove_client(s, "was removed")
+        self.game_started = False
+        self.game_ended = False
+        self.is_listening = True
+        self.accepting_clients = True
+        self.log_message("a new game can be started if u want")
+
+#==================================================================================================================================
+    def start_game(self):
+            
+        try:
+            #self.clear_log()
+            self.game_setup_frame.pack_forget()
+            self.game_started = True
+            self.is_listening = False
+            self.accepting_clients = False
+            self.log_message("===== STARTING GAME! =====")
+            self.log_message(f"Players: {list(self.players.values())}")
+            self.log_message(f"Questions to use: {self.n_questions}")
+
+            #initialize players scores to 0
+            for username in self.players.values():
+                self.scores[username] = 0
+                self.all_time_scores[username] = 0
+
+
+            for line in self.scoreboard(self.scores):
+                self.log_message(line)
+
+            self.broadcast(self.scoreboard(self.scores))
+
+            
+            for i in range(1, self.n_questions +1): # questions in game
+                n_file_q = ((i - 1)) % self.questions_in_file
+
+                self.broadcast(self.display_question(n_file_q, i))
+
+
+                # here recieve answers from cients and add them to round_answers dictionary
+                self.recieve_round_answers()
+
+                # grade round and siplay updated scoreboard when all answers are recieved
+                if len(self.round_answers.keys()) == len(self.players.keys()) and len(self.round_answers) > 0:
+                    #self.clear_log()
+                    self.grade_round(n_file_q, self.round_answers) # the scores should be updated in this function
+                    
+                    self.log_message(f"question {i} asked, scores so far:")
+                    for line in self.scoreboard(self.scores):
+                        self.log_message(line)
+                    self.broadcast(self.scoreboard(self.scores))
+                
+                # need to clear round answers before moving on to next question- happens in recieve scores
+
+                # if we are in the  last q display results:
+                if i == self.n_questions or len(self.players.keys()) < 1:
+                    result_text = self.display_results(self.all_time_scores)
+
+                    for line in result_text:
+                        self.log_message(line)
+
+                    self.broadcast(result_text)
+                    break
+            self.game_ended = True
+            if self.game_ended:
+                self.end_game()
+    
+
+        except Exception as e:  # for log issues
+            self.log_message(f"ERROR in game: {e}")  
+
+#===================================================================================================================================
+if __name__ == "__main__":
     root = tk.Tk()
-    SUquidQuizClient(root)
+    app = GameServer(root)
     root.mainloop()
- #creates main window and starts tkinter event loop
