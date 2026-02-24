@@ -92,12 +92,3 @@ Originally, `remove_client()` deleted the player's score when they left. This me
 **Bonus points for speed**
 To reward fast answers, the first player to answer correctly in a round gets extra points equal to the number of other players in the game. This means the point gap can grow quickly in larger lobbies, keeping the competition exciting.
 
----
-## Project Structure:
-
-```
-├── Server.py                    # Server application
-├── Client.py                    # Client application
-├── questions.txt                # Example question file
-└── README.md
-```
